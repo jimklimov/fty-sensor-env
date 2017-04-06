@@ -55,6 +55,7 @@ AC_PROG_AWK
 PKG_PROG_PKG_CONFIG
 
 # Code coverage
+AC_MSG_CHECKING([whether to enable GCov])
 AC_ARG_WITH(gcov, [AS_HELP_STRING([--with-gcov=yes/no],
                   [With GCC Code Coverage reporting])],
                   [FTY_SENSOR_ENV_GCOV="$withval"])
@@ -66,8 +67,27 @@ if test "x${FTY_SENSOR_ENV_GCOV}" == "xyes"; then
         CFLAGS="${CFLAGS} ${FTY_SENSOR_ENV_ORIG_CFLAGS}"
     fi
     AM_CONDITIONAL(WITH_GCOV, true)
+    AC_MSG_RESULT([yes])
 else
     AM_CONDITIONAL(WITH_GCOV, false)
+    AC_MSG_RESULT([no])
+fi
+
+# Memory mis-use detection
+AC_MSG_CHECKING([whether to enable ASan])
+AC_ARG_ENABLE(address-sanitizer, [AS_HELP_STRING([--enable-address-sanitizer=yes/no],
+                  [Build with GCC Address Sanitizer instrumentation])],
+                  [FTY_SENSOR_ENV_ASAN="$enableval"])
+
+if test "x${FTY_SENSOR_ENV_ASAN}" == "xyes"; then
+    CFLAGS="${CFLAGS} -fsanitize=address"
+    CXXFLAGS="${CXXFLAGS} -fsanitize=address"
+
+    AM_CONDITIONAL(ENABLE_ASAN, true)
+    AC_MSG_RESULT([yes])
+else
+    AM_CONDITIONAL(ENABLE_ASAN, false)
+    AC_MSG_RESULT([no])
 fi
 
 # Set pkgconfigdir
