@@ -50,6 +50,7 @@ endif
 
 EXTRA_DIST += \
     LICENSE \
+    README.md \
     src/fty_sensor_env_classes.h
 
 # NOTE: this "include" syntax is not a "make" but an "autotools" keyword,

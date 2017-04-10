@@ -111,6 +111,7 @@ find %{buildroot} -name '*.la' | xargs rm -f
 
 %files
 %defattr(-,root,root)
+%doc README.md
 %{_bindir}/fty-sensor-env
 %{_mandir}/man1/fty-sensor-env*
 /usr/lib/systemd/system/fty-sensor-env.service
