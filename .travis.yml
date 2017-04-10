@@ -22,8 +22,8 @@ sudo: false
 #dist:
 #- trusty
 
-#services:
-#- docker
+services:
+- docker
 
 # Set CI_TIME=true to enable build-step profiling in Travis
 # Set CI_TRACE=true to enable shell script tracing in Travis
@@ -82,6 +82,7 @@ matrix:
   - env: BUILD_TYPE=valgrind
     os: linux
     dist: trusty
+    sudo: required
     addons:
       apt:
         sources: *pkg_src_zeromq_ubuntu14
