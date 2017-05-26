@@ -33,6 +33,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #define POLLING_INTERVAL            5000
 #define TIME_TO_LIVE                300
+#define AGENT_NAME                  "fty-sensor-env"
 
 // ### logging
 bool agent_th_verbose = false;
@@ -41,9 +42,6 @@ bool agent_th_verbose = false;
 
 // temporary
 #define HOSTNAME_FILE "/var/lib/fty/fty-sensor-env/agent_th"
-
-fty_proto_t*
-get_measurement (char* what);
 
 // strdup is to avoid -Werror=write-strings - not enough time to rewrite it properly
 // + it's going to be proprietary code ;-)
@@ -65,26 +63,6 @@ std::map <std::string, std::string> devmap = {
     {"/dev/ttySTH2", "/dev/ttyS10"},
     {"/dev/ttySTH3", "/dev/ttyS11"},
     {"/dev/ttySTH4", "/dev/ttyS12"}
-};
-
-struct sample_agent {
-    const char* agent_name;   //!< Name of the measuring agent
-    char **variants;          //!< Various sources to iterate over
-    const char* measurement;  /*!< Printf formated string for what are we
-                                   measuring, %s will be filled with source */
-    const char* at;           /*!< Printf formated string for where are we
-                                   measuring, %s will be filled with hostname */
-    int32_t diff;             /*!< Minimum difference required for publishing */
-    fty_proto_t* (*get_measurement)(char* what); //!< Measuring itself
-};
-
-sample_agent agent = {
-    "agent-th",
-    vars,
-    "%s",
-    "%s",
-    50,
-    get_measurement
 };
 
 struct c_item {
@@ -153,7 +131,7 @@ get_measurement (char* what) {
         fty_proto_set_unit (ret, "%s", "%");
         fty_proto_set_ttl (ret, TIME_TO_LIVE);
 
-        zsys_debug("Returning H = %s %%", fty_proto_value (ret));
+        zsys_debug ("Returning H = %s %%", fty_proto_value (ret));
     }
     zhash_t *aux = zhash_new ();
     zhash_autofree (aux);
@@ -163,239 +141,81 @@ get_measurement (char* what) {
     return ret;
 }
 
-int
-main (int argc, char *argv []) {
+static bool
+s_read_statefile (const std::string& filename, std::string& rc3id)
+{
+    zsys_info ("Reading RC3 id from state file '%s'.", filename.c_str ());
+    zfile_t *file = zfile_new (NULL, filename.c_str ());
+    if (!file) {
+        zsys_error ("zfile_new (path = 'NULL', name = '%s')", filename.c_str ());
+        return false;
+    }
+    if (zfile_input (file) != 0) {
+        zfile_destroy (&file);
+        zsys_warning ("State file '%s' not found or not accessible.", filename.c_str ());
+        return false;
+    }
+    zsys_info ("State file '%s' exists and is accessible.", filename.c_str ());
+    const char *temp = zfile_readln (file);
+    if (!temp) {
+        zfile_close (file);
+        zfile_destroy (&file);
+        zsys_warning ("State file '%s' is empty.", filename.c_str ());
+        return false;
+    }
+    rc3id.assign (temp);
+    zsys_info ("RC3 id read from state file == '%s'.", rc3id.c_str ());
 
-    const char *endpoint = "ipc://@/malamute";
-    const char *addr = (argc == 1) ? "ipc://@/malamute" : argv[1];
-    char *fty_log_level = getenv ("FTY_LOG_LEVEL");
-    if (fty_log_level && streq (fty_log_level, "LOG_DEBUG"))
-        agent_th_verbose = true;
+    zfile_close (file);
+    zfile_destroy (&file);
+    return true;
+}
 
-    // Form ID from hostname and agent name
-    char xhostname[HOST_NAME_MAX];
-    gethostname(xhostname, HOST_NAME_MAX);
-    std::string hostname = xhostname;
+static void 
+s_write_statefile (const std::string& filename, const std::string& rc3id)
+{
+    zsys_info ("Writing RC3 id '%s' to state file '%s'", rc3id.c_str (), filename.c_str ());
+    zfile_t *file = zfile_new (NULL, filename.c_str ());
+    if (!file) {
+        zsys_error ("zfile_new (path = 'NULL', name = '%s')", filename.c_str ());
+        return;
+    }
 
-    bool have_rc3name = false;
+    zfile_remove (file);
 
-    // Phase 0 - init device real paths
-    zsys_info ("Phase 0 - init device real paths");
+    if (zfile_output (file) != 0) {
+        zfile_destroy (&file);
+        zsys_warning ("State file '%s' not found or not writable.", filename.c_str ());
+        return;
+    }
 
-    for (auto &it: devmap) {
-        char *patha = realpath (it.first.c_str (), NULL);
-        if (!patha) {
-            zsys_warning ("Can't get realpath of %s, using %s: %s", it.first.c_str (), it.second.c_str (), strerror (errno));
-            zstr_free (&patha);
+    zchunk_t *chunk = zchunk_new ((const void *) rc3id.c_str (), rc3id.size ());
+    int rv = zfile_write (file, chunk, (off_t) 0);
+    if (rv != 0)
+        zsys_error ("Error writing to state file '%s'.", filename.c_str ());
+    else
+        zsys_info ("Writing RC3 id '%s' to state file '%s' successfull.", rc3id.c_str (), filename.c_str ());
+    zchunk_destroy (&chunk);
+
+    zfile_close (file);
+    zfile_destroy (&file);
+    return;
+}
+
+static void
+read_sensors (mlm_client_t *client, const char *hostname)
+{
+    assert (client);
+    assert (hostname);
+    char **what = vars;
+
+    while (what != NULL && *what != NULL) {
+        fty_proto_t* msg = get_measurement (*what);
+        if (msg == NULL) {
+            zclock_sleep (100);
+            what++;
             continue;
         }
-        std::string npath {patha};
-        devmap [it.first] = npath;
-        zstr_free (&patha);
-    }
-
-    // Phase 1 - Get rack controller asset name
-    zsys_info ("Phase 1 - Get rack controller asset name");
-
-    // Temporary workaround
-    // Try to read from /var/lib/fty/fty-sensor-env/agent_th
-    zsys_info ("Trying to read from '%s' if it exists", HOSTNAME_FILE);
-
-    zfile_t *file = zfile_new (NULL, HOSTNAME_FILE);
-    if (file && zfile_input (file) == 0) {
-        zsys_info ("state file '%s' for agent_th exists", HOSTNAME_FILE);
-        const char *temp = zfile_readln (file);
-        if (temp) {
-            hostname.assign (temp);
-            zsys_info ("state file contains rc3 name '%s'", hostname.c_str ());
-            have_rc3name = true;
-        }
-        else {
-            zsys_error ("could not read from '%s'", HOSTNAME_FILE);
-        }
-        zfile_close (file);
-    }
-    zfile_destroy (&file);
-
-
-    if (have_rc3name == false) {
-        zsys_info ("Rack controller asset name not read from file -> listening to ASSETS stream for it");
-
-        mlm_client_t *listener = mlm_client_new ();
-        if (!listener) {
-            zsys_error ("mlm_client_new () failed");
-            return EXIT_FAILURE;
-        }
-
-        std::string id = std::string(agent.agent_name) + "@" + hostname;
-
-        int rv = mlm_client_connect (listener, addr, 1000, id.c_str ());
-        if (rv == -1) {
-            mlm_client_destroy (&listener);
-            zsys_error (
-                    "mlm_client_connect (endpoint = '%s', timeout = '1000', address = '%s') failed",
-                    addr, id.c_str ());
-            return EXIT_FAILURE;
-        }
-        zsys_info ("Connected to '%s'", endpoint);
-
-        rv = mlm_client_set_consumer (listener, FTY_PROTO_STREAM_ASSETS, ".*");
-        if (rv == -1) {
-            mlm_client_destroy (&listener);
-            zsys_error (
-                    "mlm_client_set_consumer (stream = '%s', pattern = '%s') failed",
-                    FTY_PROTO_STREAM_ASSETS, ".*");
-            return EXIT_FAILURE;
-        }
-        zsys_info ("Subscribed to '%s'", FTY_PROTO_STREAM_ASSETS);
-
-        zpoller_t *poller = zpoller_new (mlm_client_msgpipe (listener), NULL);
-        if (!poller) {
-            mlm_client_destroy (&listener);
-            zsys_error ("zpoller_new () failed");
-            return EXIT_FAILURE;
-        }
-
-        while (!zsys_interrupted && have_rc3name == false) {
-
-            void *which = zpoller_wait (poller, 5000); // timeout in msec
-
-            if (which == NULL) {
-                zsys_debug ("which == NULL");
-                if (zsys_interrupted) {
-                    zsys_warning ("interrupted ... ");
-                    break;
-                }
-                if (zpoller_expired (poller)) {
-                    continue;
-                }
-            }
-
-            assert (which == mlm_client_msgpipe (listener));
-            zsys_debug ("which == mlm_client_msgpipe");
-
-            zmsg_t *message = mlm_client_recv (listener);
-            if (!message) {
-                zsys_warning ("message == NULL");
-                break;
-            }
-
-            fty_proto_t *asset = fty_proto_decode (&message);
-            if (!asset || fty_proto_id (asset) != FTY_PROTO_ASSET) {
-                fty_proto_destroy (&asset);
-                zsys_warning ("fty_proto_decode () failed OR received message not FTY_PROTO_ASSET");
-                continue;
-            }
-            zsys_info ("Received asset message");
-            const char *operation = fty_proto_operation (asset);
-            const char *type = fty_proto_aux_string (asset, "type", "");
-            const char *subtype = fty_proto_aux_string (asset, "subtype", "");
-
-            if ((streq (operation, FTY_PROTO_ASSET_OP_CREATE) || streq (operation, FTY_PROTO_ASSET_OP_UPDATE)) &&
-                streq (type, "device") &&
-                streq (subtype, "rack controller"))
-            {
-                hostname = fty_proto_name (asset);
-                have_rc3name = true;
-                zsys_info ("Received rc3 name '%s'", hostname.c_str ());
-                {
-                    // Temporary workaround
-                    // Try to write to /var/lib/fty/fty-sensor-env/agent_th
-
-                    zsys_info ("Trying to write to '%s'", HOSTNAME_FILE);
-                    file = zfile_new (NULL, HOSTNAME_FILE);
-                    if (file) {
-                        zfile_remove (file);
-                        if (zfile_output (file) == 0) {
-                            zchunk_t *chunk = zchunk_new ((const void *) hostname.c_str (), hostname.size ());
-                            int rv = zfile_write (file, chunk, (off_t) 0);
-                            if (rv != 0)
-                                zsys_error ("could not write to '%s'", HOSTNAME_FILE);
-                            zchunk_destroy (&chunk);
-                            zfile_close (file);
-                        }
-                        else
-                            zsys_error ("'%s' is not writable", HOSTNAME_FILE);
-                    }
-                    else {
-                        zsys_error ("could not write to '%s'", HOSTNAME_FILE);
-                    }
-                    zfile_destroy (&file);
-                }
-            }
-            fty_proto_destroy (&asset);
-        }
-
-        zpoller_destroy (&poller);
-        mlm_client_destroy (&listener);
-    }
-    else {
-        zsys_info ("Rack controller asset name read from file.");
-    }
-
-    if (zsys_interrupted) {
-        // no reason to go further
-        return 0;
-    }
-
-    // Phase 2
-    zsys_info ("Phase 2 - Read sensor data and publish");
-
-    mlm_client_t *client = mlm_client_new ();
-    if (!client) {
-        zsys_error ("mlm_client_new () failed");
-        return EXIT_FAILURE;
-    }
-    if (getenv ("FTY_LOG_LEVEL") &&  streq (getenv ("FTY_LOG_LEVEL"), "LOG_DEBUG")) {
-        zsys_debug ("mlm_client_set_verbose");
-        mlm_client_set_verbose (client, true);
-    }
-
-    std::string id = std::string(agent.agent_name) + "@" + hostname;
-
-    int rv = mlm_client_connect (client, addr, 1000, id.c_str ());
-    if (rv == -1) {
-        mlm_client_destroy (&client);
-        zsys_error (
-                "mlm_client_connect (endpoint = '%s', timeout = '1000', address = '%s') failed",
-                addr, id.c_str ());
-        return EXIT_FAILURE;
-    }
-    zsys_info ("Connected to '%s'", endpoint);
-
-    rv = mlm_client_set_producer (client, FTY_PROTO_STREAM_METRICS_SENSOR);
-    if (rv == -1) {
-        mlm_client_destroy (&client);
-        zsys_error (
-                "mlm_client_set_producer (stream = '%s') failed",
-                FTY_PROTO_STREAM_METRICS_SENSOR);
-        return EXIT_FAILURE;
-    }
-    zsys_info ("Publishing to '%s' as '%s'", FTY_PROTO_STREAM_METRICS_SENSOR, id.c_str());
-
-    while (!zsys_interrupted) {
-        // Go through all the stuff we monitor
-        char **what = agent.variants;
-        while (what != NULL && *what != NULL && !zsys_interrupted) {
-
-            fty_proto_t* msg = agent.get_measurement(*what);
-            if (zsys_interrupted) {
-                fty_proto_destroy (&msg);
-                zsys_warning ("interrupted inner ...  ");
-                break;
-            }
-
-            if (msg == NULL) {
-                zclock_sleep (100);
-                what++;
-                if (zsys_interrupted) {
-                    fty_proto_destroy (&msg);
-                    zsys_warning ("interrupted inner ... ");
-                    break;
-                }
-                continue;
-            }
-
 /*
 --------------------------------------------------------------------------------
 stream=_METRICS_SENSOR
@@ -411,41 +231,180 @@ D: 17-02-23 14:29:12     unit='C'
 D: 17-02-23 14:29:12     ttl=300
 --------------------------------------------------------------------------------
 */
-            fty_proto_set_name (msg, "%s", hostname.c_str ());
-            fty_proto_set_time (msg, ::time (NULL));
+        fty_proto_set_name (msg, "%s", hostname);
+        fty_proto_set_time (msg, ::time (NULL));
 
-            // TODO: make some hashmap instead
-            // type="temperature./dev/sda10"
-            // port="/dev/sda10"
-            std::string type {*what};
-            auto dot_i = type.find ('.');
-            std::string port {"/dev/ttyS"};
-            port.append (type.substr (dot_i+1, 3));
-            type.replace (dot_i + 1, devmap [port].size (), devmap [port]);
+        // TODO: make some hashmap instead
+        // type="temperature./dev/sda10"
+        // port="/dev/sda10"
+        std::string type {*what};
+        auto dot_i = type.find ('.');
+        std::string port {"/dev/ttyS"};
+        port.append (type.substr (dot_i+1, 3));
+        type.replace (dot_i + 1, devmap [port].size (), devmap [port]);
 
-            fty_proto_set_type (msg, "%s", type.c_str ());
+        fty_proto_set_type (msg, "%s", type.c_str ());
 
-            // subject temperature./dev/sda10@IPC
-            std::string subject {type};
-            subject.append ("@").append (hostname);
+        // subject temperature./dev/sda10@IPC
+        std::string subject {type};
+        subject.append ("@").append (hostname);
 
-            // Send it
-            zmsg_t *to_send = fty_proto_encode (&msg);
-            rv = mlm_client_send (client, subject.c_str (), &to_send);
-            if (rv != 0) {
-                zsys_error ("mlm_client_send (subject = '%s') failed", subject.c_str ());
-            }
-
-            fty_proto_destroy (&msg);
-            what++;
+        // Send it
+        zmsg_t *to_send = fty_proto_encode (&msg);
+        int rv = mlm_client_send (client, subject.c_str (), &to_send);
+        if (rv != 0) {
+            zsys_error ("mlm_client_send (subject = '%s') failed", subject.c_str ());
         }
-        if (zsys_interrupted) {
-            zsys_warning ("interrupted ...  ");
-            break;
+
+        fty_proto_destroy (&msg);
+        what++;
+    }
+}
+
+int
+main (int argc, char *argv []) {
+
+    const char *endpoint = "ipc://@/malamute";
+    const char *addr = (argc == 1) ? "ipc://@/malamute" : argv[1];
+    char *fty_log_level = getenv ("FTY_LOG_LEVEL");
+    if (fty_log_level && streq (fty_log_level, "LOG_DEBUG"))
+        agent_th_verbose = true;
+
+    std::string hostname;
+
+    bool have_rc3id = false;
+
+    zsys_info ("Initializing device real paths.");
+    for (auto &it: devmap) {
+        char *patha = realpath (it.first.c_str (), NULL);
+        if (!patha) {
+            zsys_warning ("Can't get realpath of %s, using %s: %s", it.first.c_str (), it.second.c_str (), strerror (errno));
+            zstr_free (&patha);
+            continue;
         }
-        zclock_sleep(POLLING_INTERVAL); // monitoring interval
+        std::string npath {patha};
+        devmap [it.first] = npath;
+        zstr_free (&patha);
+    }
+    zsys_info ("Device real paths initiated.");
+
+    have_rc3id = s_read_statefile (HOSTNAME_FILE, hostname);
+
+    mlm_client_t *client = mlm_client_new ();
+    if (!client) {
+        zsys_error ("mlm_client_new () failed");
+        return EXIT_FAILURE;
     }
 
+    if (fty_log_level && streq (fty_log_level, "LOG_DEBUG")) {
+        zsys_debug ("mlm_client_set_verbose");
+        mlm_client_set_verbose (client, true);
+    }
+
+    int rv = mlm_client_connect (client, addr, 1000, AGENT_NAME);
+    if (rv == -1) {
+        mlm_client_destroy (&client);
+        zsys_error (
+                "mlm_client_connect (endpoint = '%s', timeout = '1000', address = '%s') failed",
+                addr, AGENT_NAME);
+        return EXIT_FAILURE;
+    }
+    zsys_info ("Connected to '%s'", endpoint);
+
+    rv = mlm_client_set_consumer (client, FTY_PROTO_STREAM_ASSETS, ".*");
+    if (rv == -1) {
+        mlm_client_destroy (&client);
+        zsys_error (
+                "mlm_client_set_consumer (stream = '%s', pattern = '%s') failed",
+                FTY_PROTO_STREAM_ASSETS, ".*");
+        return EXIT_FAILURE;
+    }
+    zsys_info ("Subscribed to '%s'", FTY_PROTO_STREAM_ASSETS);
+
+    rv = mlm_client_set_producer (client, FTY_PROTO_STREAM_METRICS_SENSOR);
+    if (rv == -1) {
+        mlm_client_destroy (&client);
+        zsys_error (
+                "mlm_client_set_producer (stream = '%s') failed",
+                FTY_PROTO_STREAM_METRICS_SENSOR);
+        return EXIT_FAILURE;
+    }
+    zsys_info ("Publishing to '%s' as '%s'", FTY_PROTO_STREAM_METRICS_SENSOR, AGENT_NAME);
+
+    zpoller_t *poller = zpoller_new (mlm_client_msgpipe (client), NULL);
+    if (!poller) {
+        mlm_client_destroy (&client);
+        zsys_error ("zpoller_new () failed");
+        return EXIT_FAILURE;
+    }
+
+    uint64_t timestamp = (uint64_t) zclock_mono ();
+    uint64_t timeout = (uint64_t) POLLING_INTERVAL;
+
+    while (!zsys_interrupted) {
+        zsys_debug ("cycle ... ");
+        void *which = zpoller_wait (poller, timeout);
+
+        if (which == NULL) {
+            if (zpoller_terminated (poller) || zsys_interrupted)
+                break;
+            if (zpoller_expired (poller)) {
+                if (have_rc3id)
+                    read_sensors (client, hostname.c_str ());
+            }
+            timestamp = (uint64_t) zclock_mono ();
+            continue;
+        }
+
+        uint64_t now = (uint64_t) zclock_mono ();
+        if (now - timestamp >= timeout) {
+            if (have_rc3id)
+                read_sensors (client, hostname.c_str ());
+            timestamp = (uint64_t) zclock_mono ();
+        }        
+
+        zmsg_t *message = mlm_client_recv (client);
+        if (!message)
+            break;
+
+        fty_proto_t *asset = fty_proto_decode (&message);
+        if (!asset || fty_proto_id (asset) != FTY_PROTO_ASSET) {
+            fty_proto_destroy (&asset);
+            zsys_warning ("fty_proto_decode () failed OR received message not FTY_PROTO_ASSET");
+            continue;
+        }
+        const char *operation = fty_proto_operation (asset);
+        const char *type = fty_proto_aux_string (asset, "type", "");
+        const char *subtype = fty_proto_aux_string (asset, "subtype", "");
+        const char *name = fty_proto_name (asset);
+        zsys_info ("Received an asset message, operation = '%s', name = '%s', type = '%s', subtype = '%s'",
+                operation, name, type, subtype);
+
+        if (streq (type, "device") && streq (subtype, "rack controller")) {
+            if ((streq (operation, FTY_PROTO_ASSET_OP_CREATE)
+                || streq (operation, FTY_PROTO_ASSET_OP_UPDATE))
+                && have_rc3id == false)
+            {
+                hostname.assign (name);
+                have_rc3id = true;
+                zsys_info ("Received rc3 id '%s'.", hostname.c_str ());
+                s_write_statefile (HOSTNAME_FILE, hostname);
+
+            }
+            else
+            if ((streq (operation, FTY_PROTO_ASSET_OP_DELETE)
+                || streq (operation, FTY_PROTO_ASSET_OP_RETIRE))
+                && have_rc3id == true)
+            {
+                hostname.assign ("");
+                have_rc3id = false;
+                s_write_statefile (HOSTNAME_FILE, "");
+            } 
+        }
+        fty_proto_destroy (&asset);
+    }
+
+    zpoller_destroy (&poller);
     mlm_client_destroy (&client);
     return 0;
 }
